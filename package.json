@@ -13,6 +13,7 @@
   "dependencies": {
     "crypto": "^1.0.1",
     "dgram": "^1.0.1",
+    "express": "^5.2.1",
     "net": "^1.0.2"
   }
 }

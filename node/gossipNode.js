@@ -154,7 +154,9 @@ function gossipCycle(){
 }
 
 function probeCycle(){
-    const candidates = [...PEERS].filter(p => p.id !== MY_ID);
+    const candidates = [...PEERS].filter(
+      p => p.id !== MY_ID && membership.get(p.id)?.status !== 'dead'
+    );
     if(candidates.length === 0)return;
 
     const target = candidates[Math.floor(Math.random() * candidates.length)];

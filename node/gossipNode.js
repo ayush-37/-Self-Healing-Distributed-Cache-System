@@ -27,6 +27,9 @@ PEERS.forEach(p =>{
     membership.set(p.id, {status: 'alive', incarnation: 0, lastUpdated: Date.now()});       
 });
 
+// --- Local key-value store for THIS node ---
+const localStore = new Map();
+
 
 const socket = dgram.createSocket('udp4');
 
@@ -44,9 +47,35 @@ socket.on('message', (msg, rinfo) =>{
         handleIndirectProbe(message);
     } else if(message.type === 'indirectAck'){
         handleIndirectAck(message);
+    } else if (message.type === 'store-set') {
+      handleStoreSet(message, rinfo);
+    } else if (message.type === 'store-get') {
+      handleStoreGet(message, rinfo);
+    } else if (message.type === 'store-delete') {
+      handleStoreDelete(message, rinfo);
     }
 });
 
+function handleStoreSet({ key, value, fromPort }) {
+    localStore.set(key,value);
+    console.log(`[${MY_ID}] stored key "${key}"`);
+    const ack = JSON.stringify({ type: 'store=-set-ack', key});
+    socket.send(ack, fromPort, 'localhost');
+}
+
+function handleStoreGet({ key, fromPort }) {
+  const value = localStore.has(key)? localStore.get(key) : null;
+  const reply = JSON.stringify({type: 'store-get-reply', key, value, found: localStore.has(key)});
+  socket.send(reply, fromPort, 'localhost');
+}
+
+function handleStoreDelete({ key, fromPort }) {
+  const existed = localStore.has(key);
+  localStore.delete(key);
+  console.log(`[${MY_ID}] deleted key "${key}" (existed: ${existed})`);
+  const ack = JSON.stringify({ type: 'store-delete-ack', key, existed });
+  socket.send(ack, fromPort, 'localhost');
+}
 
 function handleGossip({from, gossip}){
     for(const [nodeId, info] of Object.entries(gossip)){

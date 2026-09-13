@@ -1,4 +1,6 @@
 import dgram from 'dgram';
+import { HashRing } from './hashRing.js';
+
 
 // --- Command-line args when you launch this file ---
 //  process.argv = ["node", "script.js", "arg1", "arg2", ...]
@@ -27,6 +29,9 @@ PEERS.forEach(p =>{
     membership.set(p.id, {status: 'alive', incarnation: 0, lastUpdated: Date.now()});       
 });
 
+const ring = new HashRing(150);
+[MY_ID, ...PEERS.map(p =>p.id)].sort().forEach(n => ring.addNode(n));
+
 // --- Local key-value store for THIS node ---
 const localStore = new Map();
 
@@ -53,13 +58,65 @@ socket.on('message', (msg, rinfo) =>{
       handleStoreGet(message, rinfo);
     } else if (message.type === 'store-delete') {
       handleStoreDelete(message, rinfo);
+    } else if(message.type === 'membership-query'){
+      handleMembershipQuery(message);
+    } else if (message.type === 'resync-request') {
+        handleResyncRequest(message);
+    } else if (message.type === 'resync-response') {
+        handleResyncResponse(message);
     }
+
 });
+
+function handleResyncRequest({ from, fromPort }){
+    // Someone (from) is recovering and wants any data we hold for them.
+    // Simple approach: send back our ENTIRE local store; the requester filters what it needs.
+    const snapshot = JSON.stringify({
+      type: 'resync-response',
+      from: MY_ID,
+      data: Object.fromEntries(localStore),
+    });
+
+    socket.send(snapshot, fromPort, 'localhost');
+    console.log(`[${MY_ID}] sent resync response to ${from}`);
+}
+
+function handleResyncResponse({from, data}){
+  let adopted = 0;
+  for(const[key, value] of Object.entries(data)){
+    const owners = ring.getNodeForKey(key, 2);
+    if(owners.includes(MY_ID) && !localStore.has(key)){
+      localStore.set(key, value);
+      adopted++;
+    }
+  }
+  console.log(`[${MY_ID}] resync from ${from}: adopted ${adopted} key(s)`);
+}
+
+function requestResync(){
+  const requests = JSON.stringify({
+    type: 'resync-request',
+    from: MY_ID,
+    fromPort: MY_PORT,
+  });
+
+  PEERS.forEach(p => {
+    socket.send(requests, p.port, 'localhost',);
+  })
+}
+
+function handleMembershipQuery({fromPort}){
+  const snapshot = JSON.stringify({
+    type: 'membership-reply',
+    membership: Object.fromEntries(membership),
+  });
+  socket.send(snapshot, fromPort, 'localhost');
+}
 
 function handleStoreSet({ key, value, fromPort }) {
     localStore.set(key,value);
     console.log(`[${MY_ID}] stored key "${key}"`);
-    const ack = JSON.stringify({ type: 'store=-set-ack', key});
+    const ack = JSON.stringify({ type: 'store-set-ack', key});
     socket.send(ack, fromPort, 'localhost');
 }
 
@@ -79,6 +136,17 @@ function handleStoreDelete({ key, fromPort }) {
 
 function handleGossip({from, gossip}){
     for(const [nodeId, info] of Object.entries(gossip)){
+
+        if(nodeId === MY_ID){
+          const myInfo = membership.get(MY_ID);
+          if(info.status !== 'alive' && info.incarnation >= myInfo.incarnation){
+            const newIncarnation = info.incarnation + 1;
+            membership.set(MY_ID, {status: 'alive', incarnation: newIncarnation, lastUpdated: Date.now()});
+            console.log(`[${MY_ID}] refuting false suspicion -- bumping own incarnation to ${newIncarnation}`);
+          }
+          continue; // never apply incoming info aout ourselves -- we are the authorityon our own stauts
+        }
+
         const existing = membership.get(nodeId);
         if(!existing || info.incarnation > existing.incarnation || (info.incarnation === existing.incarnation && info.lastUpdated > existing.lastUpdated)){
             membership.set(nodeId, info);
@@ -157,9 +225,14 @@ function handleIndirectAck({ from, target, isAlive }) {
 }
 
 
-
 socket.bind(MY_PORT, () => {
   console.log(`[${MY_ID}] gossip node listening on port ${MY_PORT}`);
+  setTimeout(requestResync, 2000); 
+    /* Why 2 seconds?
+        Give other nodes time to start (if cluster is booting)
+        Give gossip a chance to establish membership
+        Avoid "thundering herd" of resyncs 
+    */
 });
 
 // --- The gossip cycle: runs once per second ---
@@ -168,17 +241,33 @@ socket.bind(MY_PORT, () => {
 
 function gossipCycle(){
     const alivePeers = PEERS.filter(p => membership.get(p.id)?.status !== 'dead');
-    if(alivePeers.length === 0) return;
+    const deadPeers = PEERS.filter(p => membership.get(p.id)?.status === 'dead');
 
-    const target = alivePeers[Math.floor(Math.random() * alivePeers.length)];
+    const targets = [];
+    if (alivePeers.length > 0) {
+        targets.push(alivePeers[Math.floor(Math.random() * alivePeers.length)]);
+    }
+
+    // Occasionally still gossip to nodes we think are dead. If they've actually
+    // restarted, this is the only way they ever hear their own old incarnation
+    // number and get a chance to self-refute (Day 8's fix can't fire on a
+    // message that never arrives).
+    if (deadPeers.length > 0 && Math.random() < 0.2) {
+        targets.push(deadPeers[Math.floor(Math.random() * deadPeers.length)]);
+    }
+
+    if (targets.length === 0) return;
 
     const payload = JSON.stringify({
+        type: 'gossip',
         from: MY_ID,
         gossip: Object.fromEntries(membership),
     });    // Turns a JavaScript object into a text string that can be sent over the network.
 
-    socket.send(payload, target.port, 'localhost', () =>{
-        console.log(`[${MY_ID}] gossiped to ${target.id}`);
+    targets.forEach(target => {
+        socket.send(payload, target.port, 'localhost', () => {
+            console.log(`[${MY_ID}] gossiped to ${target.id}`);
+        });
     });
 }
 
@@ -257,10 +346,30 @@ setInterval(() => {
 
 
 /*
-command to run the gossip node in three terminals:
+command to run the gossip node in 6 terminals:
 
-node node/gossipNode.js A 6001 "[{\"id\":\"B\",\"port\":6002},{\"id\":\"C\",\"port\":6003}]" on one terminal
-node node/gossipNode.js B 6002 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"C\",\"port\":6003}]" on another terminal    
-node node/gossipNode.js C 6003 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"B\",\"port\":6002}]" on third terminal
+Terminal 1 — Node A:
+node node/gossipNode.js A 6001 "[{\"id\":\"B\",\"port\":6002},{\"id\":\"C\",\"port\":6003},{\"id\":\"D\",\"port\":6004},{\"id\":\"E\",\"port\":6005}]"
+
+Terminal 2 — Node B:
+node node/gossipNode.js B 6002 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"C\",\"port\":6003},{\"id\":\"D\",\"port\":6004},{\"id\":\"E\",\"port\":6005}]"
+
+Terminal 3 — Node C:
+node node/gossipNode.js C 6003 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"B\",\"port\":6002},{\"id\":\"D\",\"port\":6004},{\"id\":\"E\",\"port\":6005}]"
+
+Terminal 4 — Node D:
+node node/gossipNode.js D 6004 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"B\",\"port\":6002},{\"id\":\"C\",\"port\":6003},{\"id\":\"E\",\"port\":6005}]"
+
+Terminal 5 — Node E:
+node node/gossipNode.js E 6005 "[{\"id\":\"A\",\"port\":6001},{\"id\":\"B\",\"port\":6002},{\"id\":\"C\",\"port\":6003},{\"id\":\"D\",\"port\":6004}]"
+
+Terminal 6 — API server:
+node api.js
+
+Terminal 7 (or reuse any terminal once things are running) — test commands:
+curl -X POST http://localhost:3000/set -H "Content-Type: application/json" -d '{"key":"foo","value":"bar"}'
+curl http://localhost:3000/get/foo
+curl -X DELETE http://localhost:3000/del/foo
+curl http://localhost:3000/get/foo
 
 */

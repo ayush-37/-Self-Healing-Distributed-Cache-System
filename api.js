@@ -12,6 +12,10 @@ const NODE_PORTS = {
     A: 6001, B: 6002, C: 6003, D: 6004, E: 6005,
 };
 
+// api.js's own lightweight view of cluster membership, kept fresh by periodic queries
+let knownMembership = new Map();
+const ALL_NODE_IDS = Object.keys(NODE_PORTS);
+
 const API_PORT = 7000; // this API process's own UDP port, for receiving replies
 const socket = dgram.createSocket('udp4');
 socket.bind(API_PORT);
@@ -20,19 +24,16 @@ socket.bind(API_PORT);
 const pendingRequests = new Map();
 let requestCounter = 0;
 
-// socket.on('message', (msg) =>{
-//     const message = JSON.parse(msg.toString());
-//     console.log(`[api] received message: ${JSON.stringify(message)}`);
-//     const pending = pendingRequests.get(message.key + '.' + message.type);
-//     if(pending){
-//         clearTimeout(pending.timeoutHandle);
-//         pendingRequests.delete(message.key + '.' + message.type);
-//         pending.resolve(message);
-//     }
-// });
+// s
 
 socket.on('message', (msg) => {
     const message = JSON.parse(msg.toString());
+
+    if (message.type === 'membership-reply') {
+    knownMembership = new Map(Object.entries(message.membership));
+    return;
+  }
+
     const pending = pendingRequests.get(message.key + ':' + message.type);  // fixed: ':' not '.'
     if (pending) {
         clearTimeout(pending.timeoutHandle);
@@ -69,10 +70,14 @@ app.post('/set', async (req, res) => {
     const { key, value } = req.body;
     const [primary, replica] = ring.getNodeForKey(key, 2);
 
-    const results = await Promise.allSettled([
-        sendAndWait(primary, {type: 'store-set', key, value}),
-        sendAndWait(replica, {type: 'store-set', key, value})
-    ]);
+    const targets = [primary, replica].filter(nodeId => {
+    const info = knownMembership.get(nodeId);
+        return !info || info.status !== 'dead'; // skip known-dead, allow unknown (fail open)
+    });
+
+    const results = await Promise.allSettled(
+        targets.map(nodeId => sendAndWait(nodeId, {type: 'store-set', key, value}))
+    );
 
     const anySucceeded = results.some(r => r.status === 'fulfilled');
     res.json({
@@ -86,25 +91,32 @@ app.get('/get/:key', async (req, res) => {
     const { key } = req.params;
     const [primary, replica] = ring.getNodeForKey(key, 2);
 
-    try{
-        const result = await sendAndWait(primary, {type: 'store-get', key});
-        if(result.found){
-            return res.json({status: 'ok', key, value: result.value, servedBy: primary});
-        }
-        return res.status(404).json({status: 'not found'});
-    } catch(err){
-        // primary timed out — fall back to replica
-        console.log(`[api] primary ${primary} timed out, falling back to replica ${replica}`);
-        try{
-            const result = await sendAndWait(replica, {type: 'store-get', key});
-            if(result.found){
-                return res.json({status: 'ok', key, value: result.value, servedBy: replica});
-            }
+    const primaryInfo = knownMembership.get(primary);
+    const primaryKnownDead = primaryInfo && primaryInfo.status === 'dead';
 
+    if(!primaryKnownDead){
+        try{
+            const result = await sendAndWait(primary, {type: 'store-get', key});
+            if(result.found){
+                return res.json({status: 'ok', key, value: result.value, servedBy: primary});
+            }
             return res.status(404).json({status: 'not found'});
         } catch(err){
-            return res.status(503).json({status: 'both primary and replica unreachable'});
+            console.log(`[api] primary ${primary} timed out, falling back to replica ${replica}`);
         }
+    } else {
+        console.log(`[api] primary ${primary} known dead, going straight to replica ${replica}`);
+    }
+
+    try{
+        const result = await sendAndWait(replica, {type: 'store-get', key});
+        if(result.found){
+            return res.json({status: 'ok', key, value: result.value, servedBy: replica});
+        }
+
+        return res.status(404).json({status: 'not found'});
+    } catch(err2){
+            return res.status(503).json({status: 'both primary and replica unreachable'});
     }
 });
 
@@ -124,6 +136,13 @@ app.delete('/del/:key', async (req, res) => {
     routedTo: [primary, replica],
   });
 });
+
+function refreshMembership(){
+    const randomNodeId = ALL_NODE_IDS[Math.floor(Math.random() * ALL_NODE_IDS.length)];
+    const query = JSON.stringify({type: 'membership-query', fromPort: API_PORT});
+    socket.send(query, NODE_PORTS[randomNodeId], 'localhost');
+}
+setInterval(refreshMembership, 3000); // refresh every 3 seconds
 
 
 app.listen(3000, () => console.log('Cache API listening on port 3000'));

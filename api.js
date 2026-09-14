@@ -31,6 +31,16 @@ socket.on('message', (msg) => {
 
     if (message.type === 'membership-reply') {
     knownMembership = new Map(Object.entries(message.membership));
+
+    for(const [id, info] of knownMembership){
+        if(!NODE_PORTS[id] && info.port){
+            NODE_PORTS[id] = info.port;
+            if(!ring.hasNode(id)){
+                ring.addNode(id);
+                console.log(`[api] learned of new node ${id} on port ${info.port}, added to ring`);
+            }
+        }
+    }
     return;
   }
 
@@ -138,7 +148,8 @@ app.delete('/del/:key', async (req, res) => {
 });
 
 function refreshMembership(){
-    const randomNodeId = ALL_NODE_IDS[Math.floor(Math.random() * ALL_NODE_IDS.length)];
+    const ids = Object.keys(NODE_PORTS);
+    const randomNodeId = ids[Math.floor(Math.random() * ids.length)];
     const query = JSON.stringify({type: 'membership-query', fromPort: API_PORT});
     socket.send(query, NODE_PORTS[randomNodeId], 'localhost');
 }

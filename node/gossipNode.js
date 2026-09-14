@@ -24,9 +24,9 @@ const INDIRECT_PROBE_COUNT = 2;    // how many peers to ask for indirect help
 // status: 'alive' | 'suspected' | 'dead'  (suspected/dead logic comes Day 5)
 // incarnation: version number — higher incarnation always wins when merging
 const membership = new Map();
-membership.set(MY_ID, {status: 'alive', incarnation: 0, lastUpdated: Date.now()});
+membership.set(MY_ID, {status: 'alive', incarnation: 0, lastUpdated: Date.now(), port: MY_PORT});
 PEERS.forEach(p =>{
-    membership.set(p.id, {status: 'alive', incarnation: 0, lastUpdated: Date.now()});       
+    membership.set(p.id, {status: 'alive', incarnation: 0, lastUpdated: Date.now(), port: p.port});       
 });
 
 const ring = new HashRing(150);
@@ -64,9 +64,31 @@ socket.on('message', (msg, rinfo) =>{
         handleResyncRequest(message);
     } else if (message.type === 'resync-response') {
         handleResyncResponse(message);
+    } else if (message.type === 'join') {
+        handleJoin(message);
     }
 
 });
+
+function learnNewNode(nodeId, port){
+  if(nodeId === MY_ID || !port)return ;
+  if(!PEERS.some(p => p.id === nodeId)){
+    PEERS.push({id: nodeId, port});
+  }
+  if(!ring.hasNode(nodeId)){
+    ring.addNode(nodeId);
+    console.log(`[${MY_ID}] added ${nodeId} to local ring`);
+  }
+}
+
+function handleJoin({id, port}){
+  learnNewNode(id, port);
+  if(!membership.has(id)){
+    membership.set(id, {status: 'alive', incarnation: 0, lastUpdated: Date.now(), port});
+
+  }
+  console.log(`[${MY_ID}] processed join request from ${id}`);
+}
 
 function handleResyncRequest({ from, fromPort }){
     // Someone (from) is recovering and wants any data we hold for them.
@@ -150,6 +172,10 @@ function handleGossip({from, gossip}){
         const existing = membership.get(nodeId);
         if(!existing || info.incarnation > existing.incarnation || (info.incarnation === existing.incarnation && info.lastUpdated > existing.lastUpdated)){
             membership.set(nodeId, info);
+            if(!existing){
+                learnNewNode(nodeId, info.port);
+                console.log(`[${MY_ID}] learned of new node ${nodeId} via gossip`);
+            }
         }
     }
     console.log(`[${MY_ID}] received gossip from ${from}`);
@@ -227,8 +253,12 @@ function handleIndirectAck({ from, target, isAlive }) {
 
 socket.bind(MY_PORT, () => {
   console.log(`[${MY_ID}] gossip node listening on port ${MY_PORT}`);
-  setTimeout(requestResync, 2000); 
-    /* Why 2 seconds?
+  const joinMsg = JSON.stringify({ type: 'join', id: MY_ID, port: MY_PORT});
+  PEERS.forEach(p => socket.send(joinMsg, p.port, 'localhost'));
+   console.log(`[${MY_ID}] announced join to ${PEERS.length} peer(s)`);
+  
+  setTimeout(requestResync, 3000); 
+    /* Why 3 seconds?
         Give other nodes time to start (if cluster is booting)
         Give gossip a chance to establish membership
         Avoid "thundering herd" of resyncs 

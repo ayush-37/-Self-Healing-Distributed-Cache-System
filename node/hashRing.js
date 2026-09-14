@@ -15,6 +15,10 @@ export class HashRing{
         this.ring.sort((a,b) => a.point - b.point);
     }
 
+    hasNode(nodeId){
+        return this.ring.some(entry => entry.nodeId === nodeId);
+    }
+
     removeNode(nodeId){
         this.ring = this.ring.filter(entry => entry.nodeId !== nodeId);
     }

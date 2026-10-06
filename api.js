@@ -19,6 +19,16 @@ const API_PORT = 7000;
 const socket = dgram.createSocket('udp4');
 socket.bind(API_PORT);
 
+const API_HOST = process.env.API_HOST || 'localhost';
+
+const NODE_HOSTS = {
+    A: process.env.HOST_A || 'localhost',
+    B: process.env.HOST_B || 'localhost',
+    C: process.env.HOST_C || 'localhost',
+    D: process.env.HOST_D || 'localhost',
+    E: process.env.HOST_E || 'localhost',
+};
+
 const pendingRequests = new Map();
 
 socket.on('message', (msg) => {
@@ -30,6 +40,7 @@ socket.on('message', (msg) => {
         for (const [id, info] of knownMembership) {
             if (!NODE_PORTS[id] && info.port) {
                 NODE_PORTS[id] = info.port;
+                NODE_HOSTS[id] = info.host || 'localhost';
                 if (!ring.hasNode(id)) {
                     ring.addNode(id);
                     console.log(`[api] learned of new node ${id} on port ${info.port}, added to ring`);
@@ -50,6 +61,7 @@ socket.on('message', (msg) => {
 function sendAndWait(nodeId, payload, timeoutMs = 500) {
     return new Promise((resolve, reject) => {
         const port = NODE_PORTS[nodeId];
+        const host = NODE_HOSTS[nodeId] || 'localhost';
 
         const replyTypeMap = {
             'store-set': 'store-set-ack',
@@ -65,8 +77,8 @@ function sendAndWait(nodeId, payload, timeoutMs = 500) {
 
         pendingRequests.set(requestKey, { resolve, timeoutHandle });
 
-        const message = JSON.stringify({ ...payload, fromPort: API_PORT });
-        socket.send(message, port, 'localhost');
+        const message = JSON.stringify({ ...payload, fromPort: API_PORT, fromHost: API_HOST });
+        socket.send(message, port, host);
     });
 }
 
@@ -158,8 +170,8 @@ app.delete('/del/:key', async (req, res) => {
 function refreshMembership() {
     const ids = Object.keys(NODE_PORTS);
     const randomNodeId = ids[Math.floor(Math.random() * ids.length)];
-    const query = JSON.stringify({ type: 'membership-query', fromPort: API_PORT });
-    socket.send(query, NODE_PORTS[randomNodeId], 'localhost');
+    const query = JSON.stringify({ type: 'membership-query', fromPort: API_PORT , fromHost: API_HOST });
+    socket.send(query, NODE_PORTS[randomNodeId], NODE_HOSTS[randomNodeId] || 'localhost');
 }
 setInterval(refreshMembership, 3000);
 

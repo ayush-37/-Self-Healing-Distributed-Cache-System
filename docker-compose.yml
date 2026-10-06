@@ -1,0 +1,54 @@
+services:
+  a:
+    build: .
+    command: >
+      node node/gossipNode.js A 6001
+      '[{"id":"B","port":6002,"host":"b"},{"id":"C","port":6003,"host":"c"},{"id":"D","port":6004,"host":"d"},{"id":"E","port":6005,"host":"e"}]'
+      a
+
+  b:
+    build: .
+    command: >
+      node node/gossipNode.js B 6002
+      '[{"id":"A","port":6001,"host":"a"},{"id":"C","port":6003,"host":"c"},{"id":"D","port":6004,"host":"d"},{"id":"E","port":6005,"host":"e"}]'
+      b
+
+  c:
+    build: .
+    command: >
+      node node/gossipNode.js C 6003
+      '[{"id":"A","port":6001,"host":"a"},{"id":"B","port":6002,"host":"b"},{"id":"D","port":6004,"host":"d"},{"id":"E","port":6005,"host":"e"}]'
+      c
+
+  d:
+    build: .
+    command: >
+      node node/gossipNode.js D 6004
+      '[{"id":"A","port":6001,"host":"a"},{"id":"B","port":6002,"host":"b"},{"id":"C","port":6003,"host":"c"},{"id":"E","port":6005,"host":"e"}]'
+      d
+
+  e:
+    build: .
+    command: >
+      node node/gossipNode.js E 6005
+      '[{"id":"A","port":6001,"host":"a"},{"id":"B","port":6002,"host":"b"},{"id":"C","port":6003,"host":"c"},{"id":"D","port":6004,"host":"d"}]'
+      e
+
+  api:
+    build: .
+    command: node api.js
+    ports:
+      - "3000:3000"
+    environment:
+      HOST_A: a
+      HOST_B: b
+      HOST_C: c
+      HOST_D: d
+      HOST_E: e
+      API_HOST: api
+    depends_on:
+      - a
+      - b
+      - c
+      - d
+      - e

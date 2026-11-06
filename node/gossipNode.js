@@ -8,6 +8,13 @@ import { HashRing } from './hashRing.js';
 const MY_ID = process.argv[2];
 const MY_PORT = parseInt(process.argv[3]);
 const PEERS = JSON.parse(process.argv[4]);
+const MY_HOST = process.argv[5] || 'localhost';
+PEERS.forEach(p => { if (!p.host) p.host = 'localhost'; }); 
+
+
+const MAX_KEYS = parseInt(process.argv[6]) || 50; // memory-pressure cap, per node — key-count as a proxy for real memory size 
+const EVICTION_POLICY = (process.argv[7] || 'lru').toLowerCase(); // 'lru' | 'lfu'
+
 
 // --- Failure detection ---
 const pendingProbes = new Map();
@@ -20,9 +27,9 @@ const INDIRECT_PROBE_COUNT = 2;
 // status: 'joining' | 'alive' | 'suspected' | 'dead'
 // incarnation: version number — higher incarnation always wins when merging
 const membership = new Map();
-membership.set(MY_ID, { status: 'joining', incarnation: 0, lastUpdated: Date.now(), port: MY_PORT });
+membership.set(MY_ID, { status: 'joining', incarnation: 0, lastUpdated: Date.now(), port: MY_PORT,  host: MY_HOST });
 PEERS.forEach(p => {
-    membership.set(p.id, { status: 'alive', incarnation: 0, lastUpdated: Date.now(), port: p.port });
+    membership.set(p.id, { status: 'alive', incarnation: 0, lastUpdated: Date.now(), port: p.port, host: p.host });
 });
 
 // Bug fix: every other membership.set() call site used to write a bare
@@ -35,7 +42,7 @@ function updateMembership(id, patch) {
     membership.set(id, { ...existing, ...patch, lastUpdated: Date.now() });
 }
 
-const joinMsg = JSON.stringify({ type: 'join', id: MY_ID, port: MY_PORT, status: 'joining' });
+const joinMsg = JSON.stringify({ type: 'join', id: MY_ID, port: MY_PORT, host: MY_HOST, status: 'joining' });
 
 const ring = new HashRing(150);
 [MY_ID, ...PEERS.map(p => p.id)].sort().forEach(n => ring.addNode(n));
@@ -78,10 +85,14 @@ socket.on('message', (msg, rinfo) => {
     }
 });
 
-function learnNewNode(nodeId, port) {
+socket.on('error', (err) => {
+    console.error(`[${MY_ID}] UDP socket error (non-fatal, continuing):`, err.message);
+});
+
+function learnNewNode(nodeId, port, host) {
     if (nodeId === MY_ID || !port) return;
     if (!PEERS.some(p => p.id === nodeId)) {
-        PEERS.push({ id: nodeId, port });
+        PEERS.push({ id: nodeId, port, host: host || 'localhost' });
     }
     if (!ring.hasNode(nodeId)) {
         ring.addNode(nodeId);
@@ -89,23 +100,25 @@ function learnNewNode(nodeId, port) {
     }
 }
 
-function handleJoin({ id, port, status }) {
-    learnNewNode(id, port);
+function handleJoin({ id, port, host, status }) {
+    learnNewNode(id, port, host);
     if (!membership.has(id)) {
-        membership.set(id, { status: status || 'joining', incarnation: 0, lastUpdated: Date.now(), port });
+        membership.set(id, { status: status || 'joining', incarnation: 0, lastUpdated: Date.now(), port, host: host || 'localhost' });
     }
     console.log(`[${MY_ID}] processed join from ${id} (status: ${status || 'joining'})`);
 }
 
-function handleResyncRequest({ from, fromPort }) {
+function handleResyncRequest({ from, fromPort, fromHost }) {
     // Someone (from) is recovering/joining and wants any data we hold for them.
     // Simple approach: send back our ENTIRE local store; the requester filters what it needs.
     const snapshot = JSON.stringify({
         type: 'resync-response',
         from: MY_ID,
+        fromPort: MY_PORT,
+        fromHost: MY_HOST,
         data: Object.fromEntries(localStore),
     });
-    socket.send(snapshot, fromPort, 'localhost');
+    socket.send(snapshot, fromPort, fromHost || 'localhost');
     console.log(`[${MY_ID}] sent resync response to ${from}`);
 }
 
@@ -118,7 +131,8 @@ function handleResyncResponse({ from, data }) {
 
         const owners = ring.getNodeForKey(key, 2);
         if (owners.includes(MY_ID) && !localStore.has(key)) {
-            localStore.set(key, entry);
+            evictIfNeeded();
+            localStore.set(key, {...entry, freq: entry.freq || 1});
             adopted++;
         }
     }
@@ -146,26 +160,36 @@ function completeJoin() {
 }
 
 function requestResync() {
-    const request = JSON.stringify({ type: 'resync-request', from: MY_ID, fromPort: MY_PORT });
-    PEERS.forEach(p => socket.send(request, p.port, 'localhost'));
+    const request = JSON.stringify({ type: 'resync-request', from: MY_ID, fromPort: MY_PORT, fromHost: MY_HOST });
+    PEERS.forEach(p => socket.send(request, p.port, p.host));
 }
 
-function handleMembershipQuery({ fromPort }) {
+function handleMembershipQuery({ fromPort , fromHost }) {
     const snapshot = JSON.stringify({
         type: 'membership-reply',
         membership: Object.fromEntries(membership),
     });
-    socket.send(snapshot, fromPort, 'localhost');
+    socket.send(snapshot, fromPort, fromHost || 'localhost');
 }
 
-function handleStoreSet({ key, value, expiresAt, fromPort }) {
+function handleStoreSet({ key, value, expiresAt, fromPort, fromHost}) {
+    const isNewKey = !localStore.has(key);
+    if(isNewKey) evictIfNeeded();
+
+    // delete-then-set moves this key to the MRU end of iteration order —
+    // plain map.set() on an existing key updates the value in place but
+    // does NOT move its position, which would silently break LRU ordering.
+
+    if(localStore.has(key)) localStore.delete(key);
+
     localStore.set(key, { value, expiresAt: expiresAt ?? null });
     console.log(`[${MY_ID}] stored key "${key}"${expiresAt ? ` (expires ${new Date(expiresAt).toLocaleTimeString()})` : ''}`);
+    
     const ack = JSON.stringify({ type: 'store-set-ack', key });
-    socket.send(ack, fromPort, 'localhost');
+    socket.send(ack, fromPort, fromHost || 'localhost');
 }
 
-function handleStoreGet({ key, fromPort }) {
+function handleStoreGet({ key, fromPort, fromHost }) {
     const entry = localStore.get(key);
     let value = null, found = false;
 
@@ -176,19 +200,25 @@ function handleStoreGet({ key, fromPort }) {
         } else {
             value = entry.value;
             found = true;
+            entry.freq += 1;
+
+            if(EVICTION_POLICY === 'lru'){
+                localStore.delete(key);
+                localStore.set(key, entry);
+            }
         }
     }
 
     const reply = JSON.stringify({ type: 'store-get-reply', key, value, found });
-    socket.send(reply, fromPort, 'localhost');
+    socket.send(reply, fromPort, fromHost || 'localhost');
 }
 
-function handleStoreDelete({ key, fromPort }) {
+function handleStoreDelete({ key, fromPort, fromHost }) {
     const existed = localStore.has(key);
     localStore.delete(key);
     console.log(`[${MY_ID}] deleted key "${key}" (existed: ${existed})`);
     const ack = JSON.stringify({ type: 'store-delete-ack', key, existed });
-    socket.send(ack, fromPort, 'localhost');
+    socket.send(ack, fromPort, fromHost || 'localhost');
 }
 
 function sweepExpiredKeys() {
@@ -198,6 +228,31 @@ function sweepExpiredKeys() {
             localStore.delete(key);
             console.log(`[${MY_ID}] swept expired key "${key}"`);
         }
+    }
+}
+
+function evictIfNeeded(){
+    if(localStore.size <= MAX_KEYS) return;
+    let victimKey = null;
+
+    if(EVICTION_POLICY === 'lru'){
+        let minFreq = Infinity;
+        for(const[key, entry] of localStore){
+            if(entry.freq < minFreq){
+                minFreq = entry.freq;
+                victimKey = key;
+            }
+        }
+    } else{
+        // LRU: localStore is iterated in insertion order, and every access
+        // (read or write) re-inserts the key via delete+set — so the FIRST
+        // key in iteration order is always the least-recently-used one.
+        victimKey = localStore.keys().next().value;
+    }
+
+    if(victimKey !== null){
+        localStore.delete(victimKey);
+        console.log(`[${MY_ID}] evicted key "${victimKey}" (${EVICTION_POLICY.toUpperCase()}, at capacity ${MAX_KEYS})`);
     }
 }
 
@@ -218,7 +273,7 @@ function handleGossip({ from, gossip }) {
         if (!existing || info.incarnation > existing.incarnation || (info.incarnation === existing.incarnation && info.lastUpdated > existing.lastUpdated)) {
             membership.set(nodeId, info);
             if (!existing) {
-                learnNewNode(nodeId, info.port);
+                learnNewNode(nodeId, info.port, info.host);
                 console.log(`[${MY_ID}] learned of new node ${nodeId} via gossip`);
             }
         }
@@ -226,9 +281,9 @@ function handleGossip({ from, gossip }) {
     console.log(`[${MY_ID}] received gossip from ${from}`);
 }
 
-function handleProbe({ from, fromPort }) {
+function handleProbe({ from, fromPort, fromHost }) {
     const ack = JSON.stringify({ type: 'ack', from: MY_ID });
-    socket.send(ack, fromPort, 'localhost');
+    socket.send(ack, fromPort,fromHost || 'localhost');
 }
 
 function handleAck({ from }) {
@@ -250,28 +305,28 @@ function handleAck({ from }) {
     if (relayPending) {
         clearTimeout(relayPending.timeoutHandle);
         pendingProbes.delete(`relay-${from}`);
-        const { from: askerId, fromPort: askerPort } = relayPending.relayFor;
-        reportIndirectResult(askerId, askerPort, from, true);
+        const { from: askerId, fromPort: askerPort, fromHost: askerHost } = relayPending.relayFor;
+        reportIndirectResult(askerId, askerPort, askerHost, from, true);
     }
 }
 
-function handleIndirectProbe({ from, fromPort, target, targetPort }) {
-    const ack = JSON.stringify({ type: 'probe', from: MY_ID, fromPort: MY_PORT });
-    socket.send(ack, targetPort, 'localhost');
+function handleIndirectProbe({ from, fromPort, fromHost, target, targetPort, targetHost }) {
+    const ack = JSON.stringify({ type: 'probe', from: MY_ID, fromPort: MY_PORT, fromHost: MY_HOST });
+    socket.send(ack, targetPort, targetHost || 'localhost');
 
     const relayTimeout = setTimeout(() => {
-        reportIndirectResult(from, fromPort, target, false);
+        reportIndirectResult(from, fromPort, fromHost, target, false);
     }, PROBE_TIMEOUT_MS);
 
     pendingProbes.set(`relay-${target}`, {
         timeoutHandle: relayTimeout,
-        relayFor: { from, fromPort },
+        relayFor: { from, fromPort , fromHost },
     });
 }
 
-function reportIndirectResult(from, fromPort, target, isAlive) {
+function reportIndirectResult(from, fromPort, fromHost, target, isAlive) {
     const result = JSON.stringify({ type: 'indirectAck', from: MY_ID, target, isAlive });
-    socket.send(result, fromPort, 'localhost');
+    socket.send(result, fromPort, fromHost || 'localhost');
 }
 
 function handleIndirectAck({ from, target, isAlive }) {
@@ -290,7 +345,7 @@ function handleIndirectAck({ from, target, isAlive }) {
 
 socket.bind(MY_PORT, () => {
     console.log(`[${MY_ID}] gossip node listening on port ${MY_PORT}`);
-    PEERS.forEach(p => socket.send(joinMsg, p.port, 'localhost'));
+    PEERS.forEach(p => socket.send(joinMsg, p.port, p.host));
     console.log(`[${MY_ID}] announced join to ${PEERS.length} peer(s)`);
 
     setTimeout(attemptResync, 3000);
@@ -316,7 +371,7 @@ function gossipCycle() {
     });
 
     targets.forEach(target => {
-        socket.send(payload, target.port, 'localhost', () => {
+        socket.send(payload, target.port, target.host, () => {
             console.log(`[${MY_ID}] gossiped to ${target.id}`);
         });
     });
@@ -329,8 +384,8 @@ function probeCycle() {
     if (candidates.length === 0) return;
 
     const target = candidates[Math.floor(Math.random() * candidates.length)];
-    const probe = JSON.stringify({ type: 'probe', from: MY_ID, fromPort: MY_PORT });
-    socket.send(probe, target.port, 'localhost');
+    const probe = JSON.stringify({ type: 'probe', from: MY_ID, fromPort: MY_PORT , fromHost: MY_HOST });
+    socket.send(probe, target.port, target.host);
 
     const timeoutHandle = setTimeout(() => {
         handleProbeTimeout(target);
@@ -355,10 +410,12 @@ function handleProbeTimeout(target) {
             type: 'indirectProbe',
             from: MY_ID,
             fromPort: MY_PORT,
+            fromHost: MY_HOST,
             target: target.id,
             targetPort: target.port,
+            targetHost: target.host,
         });
-        socket.send(req, helper.port, 'localhost');
+        socket.send(req, helper.port, helper.host);
     });
 
     setTimeout(() => {

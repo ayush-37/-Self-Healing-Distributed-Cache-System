@@ -19,6 +19,10 @@ const API_PORT = 7000;
 const socket = dgram.createSocket('udp4');
 socket.bind(API_PORT);
 
+socket.on('error', (err) => {
+    console.error('[api] UDP socket error (non-fatal, continuing):', err.message);
+});
+
 const API_HOST = process.env.API_HOST || 'localhost';
 
 const NODE_HOSTS = {

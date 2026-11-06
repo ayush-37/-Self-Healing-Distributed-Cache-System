@@ -15,7 +15,7 @@ function testEvenDistribution() {
 
 function testMinimalReshuffling() {
   const ring = new HashRing();
-  ['A', 'B', 'C', 'D'].forEach(n => ring.addNode(n));
+  ['A', 'B', 'C', 'D', 'E'].forEach(n => ring.addNode(n));
 
   const before = {};
   for (let i = 0; i < 10000; i++) {
@@ -120,9 +120,48 @@ Test: Large enough sample for statistical significance
   console.log(`Lookups per second: ${Math.round(1000 / avgTimePerLookup)}`);
 }
 
+
+function testModuloComparison() {
+  console.log('\n--- Consistent Hashing vs. Naive Modulo (adding a 6th node) ---');
+
+  function simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+    return hash;
+  }
+
+  // Consistent hashing side — your real ring, 5 nodes growing to 6
+  const ring = new HashRing(150);
+  ['A', 'B', 'C', 'D', 'E'].forEach(n => ring.addNode(n));
+
+  const before = {};
+  for (let i = 0; i < 10000; i++) before[`key-${i}`] = ring.getNodeForKey(`key-${i}`);
+
+  ring.addNode('F');
+
+  let ringMoved = 0;
+  for (let i = 0; i < 10000; i++) {
+    if (ring.getNodeForKey(`key-${i}`) !== before[`key-${i}`]) ringMoved++;
+  }
+
+  // Naive modulo side — same 10000 keys, same 5->6 node growth
+  let moduloMoved = 0;
+  for (let i = 0; i < 10000; i++) {
+    const h = simpleHash(`key-${i}`);
+    if (h % 5 !== h % 6) moduloMoved++;
+  }
+
+  console.log(`Consistent hashing: ${ringMoved}/10000 moved (${(ringMoved / 100).toFixed(2)}%)`);
+  console.log(`Naive modulo:       ${moduloMoved}/10000 moved (${(moduloMoved / 100).toFixed(2)}%)`);
+  console.log(`Theoretical ideal:  ~16.67% (1/6 of keys should land on the new node)`);
+}
+
 testEvenDistribution();
 
 testMinimalReshuffling();
 
 testVirtualNodesImpact();
+
 testPerformance();
+
+testModuloComparison();

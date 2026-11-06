@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 
 const NODES = [
     { id: 'A', port: 6001 },
@@ -9,19 +9,23 @@ const NODES = [
 ];
 
 const API_URL = 'http://localhost:3000';
-const REQUEST_INTERVAL_MS = 100;   // open-loop: fire on a fixed clock, don't wait for prior request
-const REQUEST_TIMEOUT_MS = 2000;   // generous — gives server-side primary->replica fallback room to finish
+const REQUEST_INTERVAL_MS = 100;
+const REQUEST_TIMEOUT_MS = 2000;
 const RETRY_DELAY_MS = 200;
-const CONVERGENCE_WAIT_MS = 12000; // all nodes start 'joining' — give them time to finish before trusting results
-const KILL_AFTER_MS = 5000;        // how long into steady traffic before we strike
-const TOTAL_RUN_MS = 30000;        // total load-test duration after convergence
+const CONVERGENCE_WAIT_MS = 12000;
+const KILL_AFTER_MS = 5000;
+const TOTAL_RUN_MS = 30000;
+
+// Set SPAWN_CLUSTER=false to run against an already-running cluster
+// (e.g. `docker compose up -d`) instead of spawning local node processes —
+// spawning while Docker already owns port 3000 is what caused the earlier
+// EADDRINUSE / hang.
+const SPAWN_CLUSTER = process.env.SPAWN_CLUSTER !== 'false';
 
 const children = [];
 
 function spawnNode({ id, port }) {
-    const peers = NODES
-        .filter(n => n.id !== id)
-        .map(n => ({ id: n.id, port: n.port }));
+    const peers = NODES.filter(n => n.id !== id).map(n => ({ id: n.id, port: n.port }));
     const args = ['node/gossipNode.js', id, String(port), JSON.stringify(peers)];
     const child = spawn('node', args, { stdio: 'inherit' });
     children.push({ id, child });
@@ -35,19 +39,32 @@ function spawnApi() {
 }
 
 function killRandomNode() {
-    const candidates = children.filter(c => c.id !== 'api');
-    const victim = candidates[Math.floor(Math.random() * candidates.length)];
-    console.log(`\n💥 CHAOS: killing node ${victim.id} (pid ${victim.child.pid}) — SIGKILL, no graceful shutdown\n`);
-    victim.child.kill('SIGKILL'); // SIGKILL, not SIGTERM — a real crash gets no cleanup, and this shouldn't either
+    if (SPAWN_CLUSTER) {
+        const candidates = children.filter(c => c.id !== 'api');
+        const victim = candidates[Math.floor(Math.random() * candidates.length)];
+        console.log(`\n💥 CHAOS: killing node ${victim.id} (pid ${victim.child.pid}) — SIGKILL, no graceful shutdown\n`);
+        victim.child.kill('SIGKILL');
+    } else {
+        // Docker mode: service names in docker-compose.yml are lowercase (a, b, c, d, e)
+        const victim = NODES[Math.floor(Math.random() * NODES.length)];
+        const service = victim.id.toLowerCase();
+        console.log(`\n💥 CHAOS: docker compose kill ${service} — SIGKILL via Docker\n`);
+        try {
+            execSync(`docker compose kill ${service}`, { stdio: 'inherit' });
+        } catch (e) {
+            console.log(`Failed to kill ${service}: ${e.message}`);
+        }
+    }
 }
 
 function shutdownAll() {
+    if (!SPAWN_CLUSTER) return; // Docker-mode cluster isn't ours to tear down
     children.forEach(({ child }) => {
         try { child.kill('SIGKILL'); } catch (e) {}
     });
 }
 
-// --- Load generation ---
+// --- Load generation (unchanged from your version) ---
 
 const stats = { total: 0, cleanSuccess: 0, recoveredOnRetry: 0, permanentFailure: 0 };
 let knownKeys = [];
@@ -115,14 +132,16 @@ function printSummary() {
     console.log('================================\n');
 }
 
-// --- Orchestration ---
-
 async function main() {
-    console.log('Spawning 5-node cluster + api.js...');
-    NODES.forEach(spawnNode);
-    spawnApi();
+    if (SPAWN_CLUSTER) {
+        console.log('Spawning 5-node cluster + api.js...');
+        NODES.forEach(spawnNode);
+        spawnApi();
+    } else {
+        console.log('SPAWN_CLUSTER=false — targeting an already-running cluster (e.g. docker compose up -d). Not spawning anything.');
+    }
 
-    console.log(`Waiting ${CONVERGENCE_WAIT_MS / 1000}s for join/convergence before starting load...`);
+    console.log(`Waiting ${CONVERGENCE_WAIT_MS / 1000}s for convergence before starting load...`);
     await new Promise(r => setTimeout(r, CONVERGENCE_WAIT_MS));
 
     console.log('Starting load generation (open-loop, fixed interval)...');
